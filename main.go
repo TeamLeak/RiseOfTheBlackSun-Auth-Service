@@ -171,7 +171,8 @@ func authMiddleware(c *gin.Context) {
 // sendResetEmail отправляет письмо для сброса пароля с использованием SMTP.
 func sendResetEmail(recipient, resetToken string) error {
 	subject := "Сброс пароля"
-	resetLink := fmt.Sprintf("%s/%s", strings.TrimRight(config.SMTP.ResetPasswordURL, "/"), resetToken)
+	// Используем URL формата reset-password?token=xxx вместо reset-password/token
+	resetLink := fmt.Sprintf("%s?token=%s", config.SMTP.ResetPasswordURL, resetToken)
 	body := fmt.Sprintf("Для сброса пароля перейдите по ссылке: %s", resetLink)
 	// Формируем сообщение
 	msg := []byte("From: " + config.SMTP.Sender + "\r\n" +
