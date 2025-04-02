@@ -2,22 +2,28 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/smtp"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/disintegration/imaging"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/uuid"
 	"github.com/patrickmn/go-cache"
+	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v2"
 	"gorm.io/driver/postgres"
@@ -69,14 +75,40 @@ func LoadConfig(filename string) (*Config, error) {
 
 // User описывает модель пользователя.
 type User struct {
-	ID          uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	Username    string     `json:"username"`
-	Email       string     `gorm:"uniqueIndex" json:"email"`
-	Password    string     `json:"-"` // Храним хэш пароля
-	Avatar      string     `json:"avatar"`
-	LastLoginAt *time.Time `json:"lastLoginAt"`
+	ID               uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	UpdatedAt        time.Time  `json:"updatedAt"`
+	Username         string     `json:"username"`
+	Email            string     `gorm:"uniqueIndex" json:"email"`
+	Password         string     `json:"-"` // Храним хэш пароля
+	Avatar           string     `json:"avatar"`
+	LastLoginAt      *time.Time `json:"lastLoginAt"`
+	TwoFactorEnabled bool       `json:"twoFactorEnabled" gorm:"default:false"`
+	TwoFactorSecret  string     `json:"-"`                  // Секрет для 2FA (TOTP)
+	TokenVersion     int        `json:"-" gorm:"default:0"` // Для инвалидации JWT токенов
+}
+
+// Cosmetic описывает модель косметического предмета (скина или плаща).
+type Cosmetic struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	CreatedAt time.Time `json:"uploadDate"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	UserID    uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	Name      string    `json:"name"`
+	Type      string    `json:"type" gorm:"type:varchar(10)"` // skin или cape
+	URL       string    `json:"url"`
+	Active    bool      `json:"active" gorm:"default:false"`
+}
+
+// LoginHistory описывает историю входов пользователя.
+type LoginHistory struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	CreatedAt time.Time `json:"date"`
+	UserID    uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	IPAddress string    `json:"ipAddress"`
+	UserAgent string    `json:"userAgent"`
+	Location  string    `json:"location"` // Локация (может определяться по IP)
+	Browser   string    `json:"browser"`  // Извлекается из User-Agent
 }
 
 var (
@@ -84,6 +116,10 @@ var (
 	config              *Config
 	tokenBlacklistCache *cache.Cache // Кэш для хранения инвалидированных токенов (logout)
 	resetTokenCache     *cache.Cache // Кэш для хранения токенов сброса пароля
+
+	// Ограничения для косметических предметов
+	MAX_SKINS = 7 // Максимальное количество скинов на пользователя
+	MAX_CAPES = 5 // Максимальное количество плащей на пользователя
 )
 
 // hashPassword генерирует bcrypt хэш пароля.
@@ -102,9 +138,10 @@ func checkPassword(password, hash string) bool {
 func generateJWT(user User) (string, error) {
 	expirationTime := time.Now().Add(time.Duration(config.Auth.TokenExpirationMinutes) * time.Minute)
 	claims := jwt.MapClaims{
-		"user_id": user.ID.String(),
-		"email":   user.Email,
-		"exp":     expirationTime.Unix(),
+		"user_id":   user.ID.String(),
+		"email":     user.Email,
+		"token_ver": user.TokenVersion, // Версия токена для инвалидации
+		"exp":       expirationTime.Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(config.Auth.JWTSecret))
@@ -428,6 +465,529 @@ func resetPasswordHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Пароль успешно изменен"})
 }
 
+// uploadAvatarHandler обрабатывает POST /user/avatar.
+func uploadAvatarHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Получаем файл из формы
+	file, err := c.FormFile("avatar")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Не удалось получить файл аватара", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Проверяем размер файла (максимум 2 МБ)
+	if file.Size > 2*1024*1024 {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Размер файла превышает 2 МБ", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Проверяем тип файла (только изображения)
+	ext := strings.ToLower(filepath.Ext(file.Filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".gif" {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неподдерживаемый формат файла. Используйте JPG, PNG или GIF", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Создаем директорию для хранения аватаров, если она не существует
+	avatarsDir := "./avatars"
+	if _, err := os.Stat(avatarsDir); os.IsNotExist(err) {
+		os.MkdirAll(avatarsDir, 0755)
+	}
+
+	// Генерируем уникальное имя файла с использованием UUID пользователя
+	fileName := fmt.Sprintf("%s%s", user.ID.String(), ext)
+	filePath := filepath.Join(avatarsDir, fileName)
+
+	// Открываем загруженный файл
+	src, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при обработке файла", "code": http.StatusInternalServerError})
+		return
+	}
+	defer src.Close()
+
+	// Создаем файл на сервере
+	dst, err := os.Create(filePath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении файла", "code": http.StatusInternalServerError})
+		return
+	}
+	defer dst.Close()
+
+	// Копируем содержимое загруженного файла
+	if _, err = io.Copy(dst, src); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении файла", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Обрабатываем изображение - изменяем размер и обрезаем до квадрата для аватара
+	src.Close()
+	dst.Close()
+
+	// Открываем сохраненное изображение для обработки
+	img, err := imaging.Open(filePath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при обработке изображения", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Обрезаем изображение до квадрата и изменяем размер до 128x128
+	img = imaging.Fill(img, 128, 128, imaging.Center, imaging.Lanczos)
+
+	// Сохраняем обработанное изображение
+	if err := imaging.Save(img, filePath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении обработанного изображения", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Обновляем URL аватара пользователя в БД
+	avatarURL := fmt.Sprintf("/avatars/%s", fileName)
+	user.Avatar = avatarURL
+
+	if err := db.Save(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при обновлении профиля", "code": http.StatusInternalServerError})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Аватар успешно обновлен",
+		"avatar":  avatarURL,
+	})
+}
+
+// getCosmeticsHandler обрабатывает GET /user/cosmetics.
+func getCosmeticsHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Получаем все косметические предметы пользователя
+	var cosmetics []Cosmetic
+	if err := db.Where("user_id = ?", user.ID).Find(&cosmetics).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при получении косметических предметов", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Подсчет количества скинов и плащей
+	var skinCount, capeCount int
+	for _, item := range cosmetics {
+		if item.Type == "skin" {
+			skinCount++
+		} else if item.Type == "cape" {
+			capeCount++
+		}
+	}
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"items":  cosmetics,
+		"limits": limits,
+	})
+}
+
+// uploadCosmeticHandler обрабатывает POST /user/cosmetics.
+func uploadCosmeticHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Получаем файл из формы
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Не удалось получить файл", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Получаем параметры из формы
+	name := c.PostForm("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Необходимо указать название", "code": http.StatusBadRequest})
+		return
+	}
+
+	cosmeticType := c.PostForm("type")
+	if cosmeticType != "skin" && cosmeticType != "cape" {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Тип должен быть 'skin' или 'cape'", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Проверяем размер файла (максимум 1 МБ)
+	if file.Size > 1*1024*1024 {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Размер файла превышает 1 МБ", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Проверяем количество уже загруженных предметов
+	var count int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, cosmeticType).Count(&count)
+
+	var maxItems int
+	if cosmeticType == "skin" {
+		maxItems = MAX_SKINS
+	} else {
+		maxItems = MAX_CAPES
+	}
+
+	if count >= int64(maxItems) {
+		c.JSON(http.StatusBadRequest, gin.H{"message": fmt.Sprintf("Достигнут лимит предметов типа %s (%d)", cosmeticType, maxItems), "code": http.StatusBadRequest})
+		return
+	}
+
+	// Создаем директорию для хранения косметических предметов
+	cosmeticsDir := filepath.Join(".", "cosmetics", cosmeticType+"s")
+	if _, err := os.Stat(cosmeticsDir); os.IsNotExist(err) {
+		os.MkdirAll(cosmeticsDir, 0755)
+	}
+
+	// Генерируем уникальное имя файла
+	itemID := uuid.New()
+	ext := strings.ToLower(filepath.Ext(file.Filename))
+	if ext == "" {
+		ext = ".png" // По умолчанию считаем PNG
+	}
+	fileName := fmt.Sprintf("%s%s", itemID.String(), ext)
+	filePath := filepath.Join(cosmeticsDir, fileName)
+
+	// Сохраняем файл
+	if err := c.SaveUploadedFile(file, filePath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении файла", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Создаем запись в БД
+	relativePath := fmt.Sprintf("/cosmetics/%ss/%s", cosmeticType, fileName)
+	cosmetic := Cosmetic{
+		ID:     itemID,
+		UserID: user.ID,
+		Name:   name,
+		Type:   cosmeticType,
+		URL:    relativePath,
+		Active: false, // По умолчанию не активен
+	}
+
+	if err := db.Create(&cosmetic).Error; err != nil {
+		// Удаляем файл в случае ошибки
+		os.Remove(filePath)
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении данных", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Подсчитываем количество скинов и плащей для ответа
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем ответ
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("%s успешно загружен", cosmeticType),
+		"item":    cosmetic,
+		"limits": gin.H{
+			"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+			"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+		},
+	})
+}
+
+// activateCosmeticHandler обрабатывает POST /user/cosmetics/:id/activate
+func activateCosmeticHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+	cosmeticID := c.Param("id")
+
+	// Проверяем, что ID валидный UUID
+	itemID, err := uuid.Parse(cosmeticID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный формат ID", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Получаем косметический предмет
+	var cosmetic Cosmetic
+	if err := db.Where("id = ? AND user_id = ?", itemID, user.ID).First(&cosmetic).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"message": "Косметический предмет не найден", "code": http.StatusNotFound})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при получении данных", "code": http.StatusInternalServerError})
+		}
+		return
+	}
+
+	// Сначала деактивируем все косметические предметы этого типа
+	if err := db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, cosmetic.Type).Update("active", false).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при обновлении данных", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Теперь активируем выбранный предмет
+	if err := db.Model(&cosmetic).Update("active", true).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при активации предмета", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Формируем ответ
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("%s успешно активирован", cosmetic.Type),
+		"item":    cosmetic,
+	})
+}
+
+// deleteCosmeticHandler обрабатывает DELETE /user/cosmetics/:id
+func deleteCosmeticHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+	cosmeticID := c.Param("id")
+
+	// Проверяем, что ID валидный UUID
+	itemID, err := uuid.Parse(cosmeticID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный формат ID", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Получаем косметический предмет
+	var cosmetic Cosmetic
+	if err := db.Where("id = ? AND user_id = ?", itemID, user.ID).First(&cosmetic).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"message": "Косметический предмет не найден", "code": http.StatusNotFound})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при получении данных", "code": http.StatusInternalServerError})
+		}
+		return
+	}
+
+	// Получаем путь к файлу
+	// Извлекаем имя файла из URL
+	fileURL := cosmetic.URL
+	parts := strings.Split(fileURL, "/")
+	fileName := parts[len(parts)-1]
+
+	// Формируем полный путь
+	cosmeticsDir := filepath.Join(".", "cosmetics", cosmetic.Type+"s")
+	filePath := filepath.Join(cosmeticsDir, fileName)
+
+	// Удаляем запись из БД
+	if err := db.Delete(&cosmetic).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при удалении данных", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Удаляем файл
+	// Не возвращаем ошибку, если файл не существует
+	_ = os.Remove(filePath)
+
+	// Подсчитываем количество скинов и плащей для ответа
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем ответ
+	c.JSON(http.StatusOK, gin.H{
+		"message":    fmt.Sprintf("%s успешно удален", cosmetic.Type),
+		"deleted_id": itemID,
+		"limits": gin.H{
+			"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+			"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+		},
+	})
+}
+
+// get2FAStatusHandler обрабатывает GET /user/2fa/status
+func get2FAStatusHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	c.JSON(http.StatusOK, gin.H{
+		"enabled": user.TwoFactorEnabled,
+		"secret":  user.TwoFactorSecret, // Возвращаем секрет только если 2FA уже настроен
+	})
+}
+
+// enable2FAHandler обрабатывает POST /user/2fa/enable
+func enable2FAHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Проверяем, что 2FA еще не включен
+	if user.TwoFactorEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "2FA уже включен", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Получаем код подтверждения из запроса
+	var req struct {
+		Code   string `json:"code"`
+		Secret string `json:"secret,omitempty"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный формат данных", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Если секрет не существует, генерируем новый
+	secret := req.Secret
+	if secret == "" && user.TwoFactorSecret == "" {
+		// Создаем новый секрет
+		key, err := totp.Generate(totp.GenerateOpts{
+			Issuer:      "RiseOfTheBlackSun",
+			AccountName: user.Email,
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при генерации ключа", "code": http.StatusInternalServerError})
+			return
+		}
+
+		// Сохраняем новый секрет в БД без активации
+		user.TwoFactorSecret = key.Secret()
+		if err := db.Model(&user).Update("two_factor_secret", key.Secret()).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении секрета", "code": http.StatusInternalServerError})
+			return
+		}
+
+		// Возвращаем новый секрет
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Сгенерирован новый секрет",
+			"secret":  key.Secret(),
+			"qr_code": key.URL(),
+		})
+		return
+	}
+
+	// Используем существующий секрет
+	if secret == "" {
+		secret = user.TwoFactorSecret
+	}
+
+	// Проверяем код
+	valid := totp.Validate(req.Code, secret)
+	if !valid {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный код", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Включаем 2FA
+	if err := db.Model(&user).Updates(map[string]interface{}{
+		"two_factor_enabled": true,
+		"two_factor_secret":  secret,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при включении 2FA", "code": http.StatusInternalServerError})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "2FA успешно включен"})
+}
+
+// disable2FAHandler обрабатывает POST /user/2fa/disable
+func disable2FAHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Проверяем, что 2FA включен
+	if !user.TwoFactorEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "2FA не включен", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Получаем код подтверждения и пароль
+	var req struct {
+		Code     string `json:"code"`
+		Password string `json:"password"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный формат данных", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Проверяем пароль
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": "Неверный пароль", "code": http.StatusUnauthorized})
+		return
+	}
+
+	// Проверяем код 2FA
+	valid := totp.Validate(req.Code, user.TwoFactorSecret)
+	if !valid {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный код 2FA", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Отключаем 2FA
+	if err := db.Model(&user).Updates(map[string]interface{}{
+		"two_factor_enabled": false,
+		"two_factor_secret":  "", // Удаляем секрет
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при отключении 2FA", "code": http.StatusInternalServerError})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "2FA успешно отключен"})
+}
+
+// getLoginHistoryHandler обрабатывает GET /user/login-history
+func getLoginHistoryHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Получаем историю входов пользователя
+	var history []LoginHistory
+
+	// По умолчанию возвращаем последние 10 записей
+	limit := 10
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if val, err := strconv.Atoi(limitStr); err == nil && val > 0 && val <= 100 {
+			limit = val
+		}
+	}
+
+	if err := db.Where("user_id = ?", user.ID).Order("created_at DESC").Limit(limit).Find(&history).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при получении истории входов", "code": http.StatusInternalServerError})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
+// changePasswordHandler обрабатывает POST /user/change-password
+func changePasswordHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Получаем текущий и новый пароль
+	var req struct {
+		CurrentPassword string `json:"current_password" binding:"required"`
+		NewPassword     string `json:"new_password" binding:"required,min=8"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный формат данных. Новый пароль должен быть не менее 8 символов", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Проверяем текущий пароль
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.CurrentPassword)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": "Неверный текущий пароль", "code": http.StatusUnauthorized})
+		return
+	}
+
+	// Хешируем новый пароль
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при хешировании пароля", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Обновляем пароль в базе данных
+	if err := db.Model(&user).Update("password", string(hashedPassword)).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при обновлении пароля", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// При смене пароля можно также выполнить выход из всех сессий
+	// Для этого меняем значение tokenVersion
+	if err := db.Model(&user).Update("token_version", user.TokenVersion+1).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сбросе сессий", "code": http.StatusInternalServerError})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Пароль успешно изменен"})
+}
+
 func main() {
 	migrateFlag := flag.Bool("migrate", false, "Выполнить миграции базы данных и выйти")
 	flag.Parse()
@@ -454,8 +1014,8 @@ func main() {
 		log.Fatalf("Ошибка подключения к базе данных: %v", err)
 	}
 
-	// Миграция модели пользователя
-	if err := db.AutoMigrate(&User{}); err != nil {
+	// Миграция моделей
+	if err := db.AutoMigrate(&User{}, &Cosmetic{}, &LoginHistory{}); err != nil {
 		log.Fatalf("Ошибка миграции: %v", err)
 	}
 
@@ -487,6 +1047,24 @@ func main() {
 	router.PATCH("/user/profile", authMiddleware, updateUserProfileHandler)
 	router.POST("/forgot-password", forgotPasswordHandler)
 	router.POST("/reset-password/:token", resetPasswordHandler)
+
+	// Эндпоинты аватара
+	router.POST("/user/avatar", authMiddleware, uploadAvatarHandler)
+	router.Static("/avatars", "./avatars")
+
+	// Эндпоинты косметических предметов
+	router.GET("/user/cosmetics", authMiddleware, getCosmeticsHandler)
+	router.POST("/user/cosmetics", authMiddleware, uploadCosmeticHandler)
+	router.POST("/user/cosmetics/:id/activate", authMiddleware, activateCosmeticHandler)
+	router.DELETE("/user/cosmetics/:id", authMiddleware, deleteCosmeticHandler)
+	router.Static("/cosmetics", "./cosmetics")
+
+	// Эндпоинты безопасности
+	router.GET("/user/2fa/status", authMiddleware, get2FAStatusHandler)
+	router.POST("/user/2fa/enable", authMiddleware, enable2FAHandler)
+	router.POST("/user/2fa/disable", authMiddleware, disable2FAHandler)
+	router.GET("/user/login-history", authMiddleware, getLoginHistoryHandler)
+	router.POST("/user/change-password", authMiddleware, changePasswordHandler)
 
 	// Запуск сервера с graceful shutdown
 	port := config.Server.Port
