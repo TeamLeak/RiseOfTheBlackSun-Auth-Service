@@ -1,0 +1,32 @@
+server:
+  port: "3000"
+  cors:
+    allowedOrigins:
+      - "http://localhost:3000"
+      - "https://api.example.com"
+    allowedMethods:
+      - GET
+      - POST
+      - PATCH
+      - DELETE
+    allowedHeaders:
+      - Origin
+      - Content-Type
+      - Authorization
+
+database:
+  type: "sqlite"
+  dsn: "auth.db"  # для postgres укажите DSN
+
+auth:
+  jwtSecret: "ВашСекретныйКлюч"
+  tokenExpirationMinutes: 60
+  resetTokenExpiration: 15
+
+smtp:
+  host: "smtp.example.com"
+  port: 587
+  username: "user@example.com"
+  password: "smtpPassword"
+  sender: "noreply@example.com"
+  resetPasswordURL: "https://app.example.com/reset-password"
