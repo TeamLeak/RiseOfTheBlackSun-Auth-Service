@@ -34,8 +34,9 @@ import (
 // Config описывает конфигурацию сервиса.
 type Config struct {
 	Server struct {
-		Port string `yaml:"port"`
-		Cors struct {
+		Port   string `yaml:"port"`
+		Domain string `yaml:"domain"`
+		Cors   struct {
 			AllowedOrigins []string `yaml:"allowedOrigins"`
 			AllowedMethods []string `yaml:"allowedMethods"`
 			AllowedHeaders []string `yaml:"allowedHeaders"`
@@ -541,8 +542,8 @@ func uploadAvatarHandler(c *gin.Context) {
 		return
 	}
 
-	// Обновляем URL аватара пользователя в БД
-	avatarURL := fmt.Sprintf("/avatars/%s", fileName)
+	// Обновляем URL аватара пользователя в БД с полным доменом из конфигурации
+	avatarURL := fmt.Sprintf("%s/avatars/%s", config.Server.Domain, fileName)
 	user.Avatar = avatarURL
 
 	if err := db.Save(&user).Error; err != nil {
@@ -656,8 +657,8 @@ func uploadCosmeticHandler(c *gin.Context) {
 		return
 	}
 
-	// Создаем запись в БД
-	relativePath := fmt.Sprintf("/cosmetics/%ss/%s", cosmeticType, fileName)
+	// Создаем запись в БД с полным доменом из конфигурации
+	relativePath := fmt.Sprintf("%s/cosmetics/%ss/%s", config.Server.Domain, cosmeticType, fileName)
 	cosmetic := Cosmetic{
 		ID:     itemID,
 		UserID: user.ID,
