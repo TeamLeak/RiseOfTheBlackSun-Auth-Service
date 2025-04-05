@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/smtp"
 	"os"
@@ -922,6 +923,243 @@ func disable2FAHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "2FA успешно отключен"})
 }
 
+// verify2FACodeHandler обрабатывает POST /user/2fa/verify
+func verify2FACodeHandler(c *gin.Context) {
+	var req struct {
+		Email string `json:"email"`
+		Code  string `json:"code"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Неверный формат данных", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Находим пользователя по email
+	var user User
+	if err := db.Where("email = ?", req.Email).First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"message": "Пользователь не найден", "code": http.StatusUnauthorized})
+		return
+	}
+
+	// Проверяем, что 2FA включен
+	if !user.TwoFactorEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "2FA не включен для данного пользователя", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Проверяем код 2FA
+	valid := totp.Validate(req.Code, user.TwoFactorSecret)
+	if !valid {
+		// Проверяем, может быть это резервный код
+		if isValidBackupCode(user.ID, req.Code) {
+			// Если это резервный код, удаляем его после использования
+			invalidateBackupCode(user.ID, req.Code)
+			// Продолжаем процесс входа
+		} else {
+			c.JSON(http.StatusUnauthorized, gin.H{"message": "Неверный код 2FA", "code": http.StatusUnauthorized})
+			return
+		}
+	}
+
+	// Генерируем JWT токен для пользователя
+	token, err := generateJWT(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при генерации токена", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Создаем запись в истории входов
+	ip := c.ClientIP()
+	userAgent := c.GetHeader("User-Agent")
+	location := "Unknown" // В реальном приложении можно определить по IP
+	browser := parseBrowser(userAgent)
+
+	loginHistory := LoginHistory{
+		ID:        uuid.New(),
+		UserID:    user.ID,
+		IPAddress: ip,
+		UserAgent: userAgent,
+		Location:  location,
+		Browser:   browser,
+	}
+
+	if err := db.Create(&loginHistory).Error; err != nil {
+		log.Printf("Ошибка при сохранении истории входа: %v", err)
+	}
+
+	// Обновляем время последнего входа
+	now := time.Now()
+	user.LastLoginAt = &now
+	db.Model(&user).Update("last_login_at", &now)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "2FA успешно подтвержден",
+		"token":   token,
+	})
+}
+
+// BackupCode представляет структуру резервных кодов
+type BackupCode struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	UserID    uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	Code      string    `json:"code"`
+	CreatedAt time.Time `json:"createdAt"`
+	Used      bool      `json:"used" gorm:"default:false"`
+}
+
+// generateBackupCodesHandler обрабатывает POST /user/2fa/backup-codes
+func generateBackupCodesHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Проверяем, что 2FA включен
+	if !user.TwoFactorEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Сначала необходимо включить 2FA", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Удаляем старые резервные коды
+	db.Where("user_id = ?", user.ID).Delete(&BackupCode{})
+
+	// Генерируем 8 новых резервных кодов
+	codes := make([]BackupCode, 8)
+	formattedCodes := make([]string, 8)
+
+	for i := 0; i < 8; i++ {
+		// Генерируем 6-значный код
+		codePart1 := fmt.Sprintf("%06d", rand.Intn(1000000))
+		codePart2 := fmt.Sprintf("%06d", rand.Intn(1000000))
+		code := fmt.Sprintf("%s-%s", codePart1, codePart2)
+
+		codes[i] = BackupCode{
+			ID:     uuid.New(),
+			UserID: user.ID,
+			Code:   code,
+		}
+
+		formattedCodes[i] = code
+	}
+
+	// Сохраняем коды в БД
+	for _, code := range codes {
+		if err := db.Create(&code).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении резервных кодов", "code": http.StatusInternalServerError})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Резервные коды успешно сгенерированы",
+		"codes":   formattedCodes,
+	})
+}
+
+// getBackupCodesHandler обрабатывает GET /user/2fa/backup-codes
+func getBackupCodesHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Проверяем, что 2FA включен
+	if !user.TwoFactorEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Сначала необходимо включить 2FA", "code": http.StatusBadRequest})
+		return
+	}
+
+	// Получаем активные резервные коды
+	var codes []BackupCode
+	if err := db.Where("user_id = ? AND used = ?", user.ID, false).Find(&codes).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при получении резервных кодов", "code": http.StatusInternalServerError})
+		return
+	}
+
+	// Форматируем коды для отображения
+	formattedCodes := make([]string, len(codes))
+	for i, code := range codes {
+		formattedCodes[i] = code.Code
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"codes": formattedCodes,
+	})
+}
+
+// isValidBackupCode проверяет, является ли код действительным резервным кодом
+func isValidBackupCode(userID uuid.UUID, code string) bool {
+	var backupCode BackupCode
+	result := db.Where("user_id = ? AND code = ? AND used = ?", userID, code, false).First(&backupCode)
+	return result.Error == nil
+}
+
+// invalidateBackupCode помечает резервный код как использованный
+func invalidateBackupCode(userID uuid.UUID, code string) {
+	db.Model(&BackupCode{}).Where("user_id = ? AND code = ?", userID, code).Update("used", true)
+}
+
+// parseBrowser извлекает информацию о браузере из User-Agent
+func parseBrowser(userAgent string) string {
+	userAgent = strings.ToLower(userAgent)
+	switch {
+	case strings.Contains(userAgent, "firefox"):
+		return "Firefox"
+	case strings.Contains(userAgent, "chrome") && !strings.Contains(userAgent, "edg"):
+		return "Chrome"
+	case strings.Contains(userAgent, "safari") && !strings.Contains(userAgent, "chrome"):
+		return "Safari"
+	case strings.Contains(userAgent, "edg"):
+		return "Edge"
+	case strings.Contains(userAgent, "opera"):
+		return "Opera"
+	default:
+		return "Unknown"
+	}
+}
+
+// get2FAQrCodeHandler обрабатывает GET /user/2fa/qrcode
+func get2FAQrCodeHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Проверяем, что у пользователя есть секрет
+	if user.TwoFactorSecret == "" {
+		// Если секрета нет, создаем новый
+		key, err := totp.Generate(totp.GenerateOpts{
+			Issuer:      "RiseOfTheBlackSun",
+			AccountName: user.Email,
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при генерации ключа", "code": http.StatusInternalServerError})
+			return
+		}
+
+		// Сохраняем секрет в БД
+		user.TwoFactorSecret = key.Secret()
+		if err := db.Model(&user).Update("two_factor_secret", key.Secret()).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при сохранении секрета", "code": http.StatusInternalServerError})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"qr_url": key.URL(),
+			"secret": key.Secret(),
+		})
+		return
+	}
+
+	// Если секрет уже есть, создаем URL для QR-кода
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "RiseOfTheBlackSun",
+		AccountName: user.Email,
+		Secret:      []byte(user.TwoFactorSecret),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Ошибка при генерации QR-кода", "code": http.StatusInternalServerError})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"qr_url": key.URL(),
+		"secret": user.TwoFactorSecret,
+	})
+}
+
 // getLoginHistoryHandler обрабатывает GET /user/login-history
 func getLoginHistoryHandler(c *gin.Context) {
 	user := c.MustGet("user").(User)
@@ -1016,7 +1254,7 @@ func main() {
 	}
 
 	// Миграция моделей
-	if err := db.AutoMigrate(&User{}, &Cosmetic{}, &LoginHistory{}); err != nil {
+	if err := db.AutoMigrate(&User{}, &Cosmetic{}, &LoginHistory{}, &BackupCode{}); err != nil {
 		log.Fatalf("Ошибка миграции: %v", err)
 	}
 
@@ -1028,6 +1266,9 @@ func main() {
 	// Инициализация in-memory кэшей
 	tokenBlacklistCache = cache.New(time.Duration(config.Auth.TokenExpirationMinutes)*time.Minute, 10*time.Minute)
 	resetTokenCache = cache.New(time.Duration(config.Auth.ResetTokenExpiration)*time.Minute, 10*time.Minute)
+
+	// Инициализация генератора случайных чисел для создания резервных кодов
+	// В новых версиях Go используется rand.NewSource и rand.New вместо устаревшего rand.Seed
 
 	// Инициализация Gin и настройка CORS
 	router := gin.Default()
@@ -1066,6 +1307,12 @@ func main() {
 	router.POST("/user/2fa/disable", authMiddleware, disable2FAHandler)
 	router.GET("/user/login-history", authMiddleware, getLoginHistoryHandler)
 	router.POST("/user/change-password", authMiddleware, changePasswordHandler)
+
+	// Дополнительные эндпоинты 2FA
+	router.POST("/user/2fa/verify", verify2FACodeHandler)
+	router.GET("/user/2fa/qrcode", authMiddleware, get2FAQrCodeHandler)
+	router.POST("/user/2fa/backup-codes", authMiddleware, generateBackupCodesHandler)
+	router.GET("/user/2fa/backup-codes", authMiddleware, getBackupCodesHandler)
 
 	// Запуск сервера с graceful shutdown
 	port := config.Server.Port
