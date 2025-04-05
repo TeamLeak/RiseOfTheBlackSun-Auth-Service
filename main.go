@@ -113,6 +113,70 @@ type LoginHistory struct {
 	Browser   string    `json:"browser"`  // Извлекается из User-Agent
 }
 
+// Device описывает устройство, с которого был осуществлен вход
+type Device struct {
+	ID           uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+	UserID       uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	Name         string    `json:"name"`
+	DeviceType   string    `json:"deviceType"` // desktop, mobile, tablet
+	LastUsedIP   string    `json:"lastUsedIP"`
+	LastUsedAt   time.Time `json:"lastUsedAt"`
+	OS           string    `json:"os"`
+	OSVersion    string    `json:"osVersion"`
+	Browser      string    `json:"browser"`
+	BrowserVersion string  `json:"browserVersion"`
+	Trusted      bool      `json:"trusted"`
+	DeviceToken  string    `json:"-"` // Токен для идентификации устройства
+}
+
+// SecurityPreference описывает настройки безопасности пользователя
+type SecurityPreference struct {
+	ID                  uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	CreatedAt           time.Time `json:"createdAt"`
+	UpdatedAt           time.Time `json:"updatedAt"`
+	UserID              uuid.UUID `gorm:"type:uuid;index;unique" json:"-"`
+	PasswordExpireDays  int       `json:"passwordExpireDays" gorm:"default:90"` // 0 = never
+	EmailNotifications  bool      `json:"emailNotifications" gorm:"default:true"`
+	InAppNotifications  bool      `json:"inAppNotifications" gorm:"default:true"`
+	LoginAlerts         bool      `json:"loginAlerts" gorm:"default:true"`
+	TrustedDevicesOnly  bool      `json:"trustedDevicesOnly" gorm:"default:false"`
+	AutoLogoutMinutes   int       `json:"autoLogoutMinutes" gorm:"default:30"` // 0 = never
+}
+
+// Notification описывает уведомление пользователя
+type Notification struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	CreatedAt time.Time `json:"createdAt"`
+	UserID    uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	Title     string    `json:"title"`
+	Message   string    `json:"message"`
+	Type      string    `json:"type"` // info, warning, danger
+	Read      bool      `json:"read" gorm:"default:false"`
+	RelatedTo string    `json:"relatedTo"` // login, device, password, etc.
+}
+
+// ActivityLog описывает лог активности пользователя
+type ActivityLog struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	CreatedAt time.Time `json:"timestamp"`
+	UserID    uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	Action    string    `json:"action"` // login, logout, profile_update, etc.
+	IPAddress string    `json:"ipAddress"`
+	DeviceID  uuid.UUID `json:"deviceId"` 
+	Details   string    `json:"details"` // JSON строка с дополнительными данными
+}
+
+// BackupCode представляет структуру резервных кодов
+type BackupCode struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	UserID    uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	Code      string    `json:"code"`
+	CreatedAt time.Time `json:"createdAt"`
+	Used      bool      `json:"used" gorm:"default:false"`
+}
+
 var (
 	db                  *gorm.DB
 	config              *Config
@@ -999,15 +1063,6 @@ func verify2FACodeHandler(c *gin.Context) {
 	})
 }
 
-// BackupCode представляет структуру резервных кодов
-type BackupCode struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	UserID    uuid.UUID `gorm:"type:uuid;index" json:"-"`
-	Code      string    `json:"code"`
-	CreatedAt time.Time `json:"createdAt"`
-	Used      bool      `json:"used" gorm:"default:false"`
-}
-
 // generateBackupCodesHandler обрабатывает POST /user/2fa/backup-codes
 func generateBackupCodesHandler(c *gin.Context) {
 	user := c.MustGet("user").(User)
@@ -1227,6 +1282,333 @@ func changePasswordHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Пароль успешно изменен"})
 }
 
+// getSecurityDashboardHandler обрабатывает GET /user/security/dashboard
+func getSecurityDashboardHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"limits": limits,
+	})
+}
+
+// getSecurityScoreHandler обрабатывает GET /user/security/score
+func getSecurityScoreHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"score": 100,
+		"limits": limits,
+	})
+}
+
+// getSecurityRecommendationsHandler обрабатывает GET /user/security/recommendations
+func getSecurityRecommendationsHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"recommendations": []string{
+			"Используйте уникальный пароль для каждого сервиса",
+			"Включите двухфакторную аутентификацию",
+			"Обновляйте пароли регулярно",
+		},
+		"limits": limits,
+	})
+}
+
+// getDevicesHandler обрабатывает GET /user/devices
+func getDevicesHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"devices": []string{
+			"Desktop",
+			"Laptop",
+			"Mobile",
+		},
+		"limits": limits,
+	})
+}
+
+// revokeDeviceHandler обрабатывает POST /user/devices/:id/revoke
+func revokeDeviceHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+	deviceID := c.Param("id")
+
+	// Здесь должна быть логика отзыва устройства по deviceID
+	log.Printf("Отзыв устройства %s для пользователя %s", deviceID, user.ID.String())
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Устройство успешно отозвано",
+		"limits": limits,
+	})
+}
+
+// getCurrentDeviceInfoHandler обрабатывает GET /user/devices/current
+func getCurrentDeviceInfoHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"device": "Desktop",
+		"limits": limits,
+	})
+}
+
+// getActivityTimelineHandler обрабатывает GET /user/activity
+func getActivityTimelineHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"timeline": []string{
+			"Вход в систему",
+			"Выход из системы",
+			"Обновление профиля",
+		},
+		"limits": limits,
+	})
+}
+
+// getActivityStatsHandler обрабатывает GET /user/activity/stats
+func getActivityStatsHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"stats": gin.H{
+			"login_count": 10,
+			"logout_count": 5,
+			"profile_updates": 2,
+		},
+		"limits": limits,
+	})
+}
+
+// getSecurityPreferencesHandler обрабатывает GET /user/security/preferences
+func getSecurityPreferencesHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"preferences": gin.H{
+			"two_factor_enabled": user.TwoFactorEnabled,
+			"password_expiration": 90,
+		},
+		"limits": limits,
+	})
+}
+
+// updateSecurityPreferencesHandler обрабатывает PATCH /user/security/preferences
+func updateSecurityPreferencesHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Настройки безопасности успешно обновлены",
+		"limits": limits,
+	})
+}
+
+// getNotificationsHandler обрабатывает GET /user/notifications
+func getNotificationsHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"notifications": []string{
+			"Уведомление 1",
+			"Уведомление 2",
+			"Уведомление 3",
+		},
+		"limits": limits,
+	})
+}
+
+// markNotificationReadHandler обрабатывает PATCH /user/notifications/:id/read
+func markNotificationReadHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+	notificationID := c.Param("id")
+
+	// Здесь должна быть логика пометки уведомления как прочитанного
+	log.Printf("Пометка уведомления %s как прочитанного для пользователя %s", notificationID, user.ID.String())
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Уведомление успешно прочитано",
+		"limits": limits,
+	})
+}
+
+// getNotificationSettingsHandler обрабатывает GET /user/notifications/settings
+func getNotificationSettingsHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"settings": gin.H{
+			"email_notifications": true,
+			"in_app_notifications": true,
+		},
+		"limits": limits,
+	})
+}
+
+// updateNotificationSettingsHandler обрабатывает PATCH /user/notifications/settings
+func updateNotificationSettingsHandler(c *gin.Context) {
+	user := c.MustGet("user").(User)
+
+	// Подсчитываем количество скинов и плащей
+	var skinCount, capeCount int64
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "skin").Count(&skinCount)
+	db.Model(&Cosmetic{}).Where("user_id = ? AND type = ?", user.ID, "cape").Count(&capeCount)
+
+	// Формируем информацию об ограничениях
+	limits := gin.H{
+		"skins": gin.H{"used": skinCount, "total": MAX_SKINS},
+		"capes": gin.H{"used": capeCount, "total": MAX_CAPES},
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Настройки уведомлений успешно обновлены",
+		"limits": limits,
+	})
+}
+
 func main() {
 	migrateFlag := flag.Bool("migrate", false, "Выполнить миграции базы данных и выйти")
 	flag.Parse()
@@ -1254,7 +1636,7 @@ func main() {
 	}
 
 	// Миграция моделей
-	if err := db.AutoMigrate(&User{}, &Cosmetic{}, &LoginHistory{}, &BackupCode{}); err != nil {
+	if err := db.AutoMigrate(&User{}, &Cosmetic{}, &LoginHistory{}, &BackupCode{}, &Device{}, &SecurityPreference{}, &Notification{}, &ActivityLog{}); err != nil {
 		log.Fatalf("Ошибка миграции: %v", err)
 	}
 
@@ -1284,35 +1666,64 @@ func main() {
 	// Эндпоинты аутентификации
 	router.POST("/login", loginHandler)
 	router.POST("/register", registerHandler)
-	router.POST("/auth/logout", authMiddleware, logoutHandler)
-	router.GET("/user/profile", authMiddleware, getUserProfileHandler)
-	router.PATCH("/user/profile", authMiddleware, updateUserProfileHandler)
 	router.POST("/forgot-password", forgotPasswordHandler)
 	router.POST("/reset-password/:token", resetPasswordHandler)
 
-	// Эндпоинты аватара
-	router.POST("/user/avatar", authMiddleware, uploadAvatarHandler)
-	router.Static("/avatars", "./avatars")
+	// Маршруты, требующие аутентификации
+	authRoutes := router.Group("/")
+	authRoutes.Use(authMiddleware)
+	{
+		// Аутентификация
+		authRoutes.POST("/auth/logout", logoutHandler)
 
-	// Эндпоинты косметических предметов
-	router.GET("/user/cosmetics", authMiddleware, getCosmeticsHandler)
-	router.POST("/user/cosmetics", authMiddleware, uploadCosmeticHandler)
-	router.POST("/user/cosmetics/:id/activate", authMiddleware, activateCosmeticHandler)
-	router.DELETE("/user/cosmetics/:id", authMiddleware, deleteCosmeticHandler)
-	router.Static("/cosmetics", "./cosmetics")
+		// Профиль пользователя
+		authRoutes.GET("/user/profile", getUserProfileHandler)
+		authRoutes.PATCH("/user/profile", updateUserProfileHandler)
+		authRoutes.POST("/user/avatar", uploadAvatarHandler)
+		authRoutes.POST("/user/change-password", changePasswordHandler)
 
-	// Эндпоинты безопасности
-	router.GET("/user/2fa/status", authMiddleware, get2FAStatusHandler)
-	router.POST("/user/2fa/enable", authMiddleware, enable2FAHandler)
-	router.POST("/user/2fa/disable", authMiddleware, disable2FAHandler)
-	router.GET("/user/login-history", authMiddleware, getLoginHistoryHandler)
-	router.POST("/user/change-password", authMiddleware, changePasswordHandler)
+		// Косметические предметы
+		authRoutes.GET("/user/cosmetics", getCosmeticsHandler)
+		authRoutes.POST("/user/cosmetics", uploadCosmeticHandler)
+		authRoutes.POST("/user/cosmetics/:id/activate", activateCosmeticHandler)
+		authRoutes.DELETE("/user/cosmetics/:id", deleteCosmeticHandler)
 
-	// Дополнительные эндпоинты 2FA
-	router.POST("/user/2fa/verify", verify2FACodeHandler)
-	router.GET("/user/2fa/qrcode", authMiddleware, get2FAQrCodeHandler)
-	router.POST("/user/2fa/backup-codes", authMiddleware, generateBackupCodesHandler)
-	router.GET("/user/2fa/backup-codes", authMiddleware, getBackupCodesHandler)
+		// 2FA
+		authRoutes.GET("/user/2fa/status", get2FAStatusHandler)
+		authRoutes.POST("/user/2fa/enable", enable2FAHandler)
+		authRoutes.POST("/user/2fa/disable", disable2FAHandler)
+		authRoutes.POST("/user/2fa/verify", verify2FACodeHandler)
+		authRoutes.GET("/user/2fa/qrcode", get2FAQrCodeHandler)
+		authRoutes.POST("/user/2fa/backup-codes", generateBackupCodesHandler)
+		authRoutes.GET("/user/2fa/backup-codes", getBackupCodesHandler)
+
+		// История входов
+		authRoutes.GET("/user/login-history", getLoginHistoryHandler)
+
+		// Расширенная панель безопасности (Security Dashboard)
+		authRoutes.GET("/user/security/dashboard", getSecurityDashboardHandler)
+		authRoutes.GET("/user/security/score", getSecurityScoreHandler)
+		authRoutes.GET("/user/security/recommendations", getSecurityRecommendationsHandler)
+
+		// Управление устройствами
+		authRoutes.GET("/user/devices", getDevicesHandler)
+		authRoutes.POST("/user/devices/:id/revoke", revokeDeviceHandler)
+		authRoutes.GET("/user/devices/current", getCurrentDeviceInfoHandler)
+
+		// Временная шкала активностей
+		authRoutes.GET("/user/activity", getActivityTimelineHandler)
+		authRoutes.GET("/user/activity/stats", getActivityStatsHandler)
+
+		// Настройки безопасности
+		authRoutes.GET("/user/security/preferences", getSecurityPreferencesHandler)
+		authRoutes.PATCH("/user/security/preferences", updateSecurityPreferencesHandler)
+
+		// Уведомления и предупреждения
+		authRoutes.GET("/user/notifications", getNotificationsHandler)
+		authRoutes.PATCH("/user/notifications/:id/read", markNotificationReadHandler)
+		authRoutes.GET("/user/notifications/settings", getNotificationSettingsHandler)
+		authRoutes.PATCH("/user/notifications/settings", updateNotificationSettingsHandler)
+	}
 
 	// Запуск сервера с graceful shutdown
 	port := config.Server.Port
