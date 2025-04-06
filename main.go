@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,6 +31,13 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+)
+
+// Constants for App Version and other important values
+const (
+	AppVersion = "1.2.0"
+	DefaultLang = "en"
+	DefaultTheme = "dark"
 )
 
 // Config описывает конфигурацию сервиса.
@@ -88,6 +96,8 @@ type User struct {
 	TwoFactorEnabled bool       `json:"twoFactorEnabled" gorm:"default:false"`
 	TwoFactorSecret  string     `json:"-"`                  // Секрет для 2FA (TOTP)
 	TokenVersion     int        `json:"-" gorm:"default:0"` // Для инвалидации JWT токенов
+	Language         string     `json:"language" gorm:"default:'en'"` // Предпочитаемый язык пользователя (en/ru)
+	Theme            string     `json:"theme" gorm:"default:'dark'"` // Предпочитаемая тема (dark/light)
 }
 
 // Cosmetic описывает модель косметического предмета (скина или плаща).
@@ -111,6 +121,7 @@ type LoginHistory struct {
 	UserAgent string    `json:"userAgent"`
 	Location  string    `json:"location"` // Локация (может определяться по IP)
 	Browser   string    `json:"browser"`  // Извлекается из User-Agent
+	Success   bool      `json:"success" gorm:"default:true"` // Успешность входа
 }
 
 // Device описывает устройство, с которого был осуществлен вход
@@ -177,13 +188,40 @@ type BackupCode struct {
 	Used      bool      `json:"used" gorm:"default:false"`
 }
 
+// StandardResponse представляет стандартную структуру ответа API
+type StandardResponse struct {
+	Success bool        `json:"success"`
+	Message string      `json:"message,omitempty"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+// PerformanceConfig представляет настройки производительности UI
+type PerformanceConfig struct {
+	ID                 uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	UserID             uuid.UUID `gorm:"type:uuid;index;unique" json:"-"`
+	ReduceShadows      bool      `json:"reduceShadows" gorm:"default:false"`      // Уменьшить сложность теней
+	LightEffects       bool      `json:"lightEffects" gorm:"default:false"`       // Использовать облегченные эффекты
+	BlurIntensity      int       `json:"blurIntensity" gorm:"default:5"`          // Интенсивность размытия (1-10)
+	AnimationsEnabled  bool      `json:"animationsEnabled" gorm:"default:true"`   // Включение/отключение анимаций
+	PreloadAssets      bool      `json:"preloadAssets" gorm:"default:true"`       // Предзагрузка ресурсов
+	ImageQuality       int       `json:"imageQuality" gorm:"default:90"`          // Качество изображений (1-100)
+	EnableHardwareAcceleration bool `json:"enableHardwareAcceleration" gorm:"default:true"` // Использовать аппаратное ускорение
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+}
+
 var (
 	db                  *gorm.DB
 	config              *Config
 	tokenBlacklistCache *cache.Cache // Кэш для хранения инвалидированных токенов (logout)
 	resetTokenCache     *cache.Cache // Кэш для хранения токенов сброса пароля
+	rateLimiterCache    *cache.Cache // Кэш для ограничения частоты запросов
+	startTime           time.Time
+)
 
-	// Ограничения для косметических предметов
+// Ограничения для косметических предметов
+const (
 	MAX_SKINS = 7 // Максимальное количество скинов на пользователя
 	MAX_CAPES = 5 // Максимальное количество плащей на пользователя
 )
@@ -1046,6 +1084,7 @@ func verify2FACodeHandler(c *gin.Context) {
 		UserAgent: userAgent,
 		Location:  location,
 		Browser:   browser,
+		Success:   true,
 	}
 
 	if err := db.Create(&loginHistory).Error; err != nil {
@@ -1609,9 +1648,636 @@ func updateNotificationSettingsHandler(c *gin.Context) {
 	})
 }
 
+// updateUserPreferencesHandler обрабатывает PATCH /user/preferences
+func updateUserPreferencesHandler(c *gin.Context) {
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, StandardResponse{
+			Success: false,
+			Error:   "Пользователь не авторизован",
+		})
+		return
+	}
+
+	var user User
+	if err := db.First(&user, "id = ?", userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, StandardResponse{
+			Success: false,
+			Error:   "Пользователь не найден",
+		})
+		return
+	}
+
+	var request struct {
+		Language *string `json:"language"`
+		Theme    *string `json:"theme"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Некорректные данные запроса",
+		})
+		return
+	}
+
+	updated := false
+	if request.Language != nil {
+		if *request.Language != "en" && *request.Language != "ru" {
+			c.JSON(http.StatusBadRequest, StandardResponse{
+				Success: false,
+				Error:   "Поддерживаемые языки: en, ru",
+			})
+			return
+		}
+		user.Language = *request.Language
+		updated = true
+	}
+
+	if request.Theme != nil {
+		if *request.Theme != "dark" && *request.Theme != "light" {
+			c.JSON(http.StatusBadRequest, StandardResponse{
+				Success: false,
+				Error:   "Поддерживаемые темы: dark, light",
+			})
+			return
+		}
+		user.Theme = *request.Theme
+		updated = true
+	}
+
+	if !updated {
+		c.JSON(http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Не указаны параметры для обновления",
+		})
+		return
+	}
+
+	if err := db.Save(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, StandardResponse{
+			Success: false,
+			Error:   "Ошибка при обновлении настроек пользователя",
+		})
+		return
+	}
+
+	// Записываем в логи активности
+	activityLog := ActivityLog{
+		ID:        uuid.New(),
+		UserID:    user.ID,
+		Action:    "user_preferences_update",
+		IPAddress: c.ClientIP(),
+		Details:   fmt.Sprintf("Обновлены настройки: язык=%s, тема=%s", user.Language, user.Theme),
+	}
+	db.Create(&activityLog)
+
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Message: "Настройки пользователя успешно обновлены",
+		Data: gin.H{
+			"language": user.Language,
+			"theme":    user.Theme,
+		},
+	})
+}
+
+// getUserPreferencesHandler обрабатывает GET /user/preferences
+func getUserPreferencesHandler(c *gin.Context) {
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, StandardResponse{
+			Success: false,
+			Error:   "Пользователь не авторизован",
+		})
+		return
+	}
+
+	var user User
+	if err := db.First(&user, "id = ?", userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, StandardResponse{
+			Success: false,
+			Error:   "Пользователь не найден",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Data: gin.H{
+			"language": user.Language,
+			"theme":    user.Theme,
+		},
+	})
+}
+
+// getVersionHandler обрабатывает GET /version для получения информации о версии API
+func getVersionHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Data: gin.H{
+			"version": AppVersion,
+			"name":    "Rise Of The Black Sun Auth API",
+			"supportedLanguages": []string{"en", "ru"},
+			"supportedThemes": []string{"dark", "light"},
+		},
+	})
+}
+
+// healthCheckHandler обрабатывает GET /health для проверки работоспособности сервиса
+func healthCheckHandler(c *gin.Context) {
+	// Проверяем соединение с БД, делая простой запрос
+	sqlDB, err := db.DB()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, StandardResponse{
+			Success: false,
+			Error:   "Ошибка подключения к базе данных",
+		})
+		return
+	}
+
+	// Проверяем соединение с БД с помощью простого ping-запроса
+	if err := sqlDB.Ping(); err != nil {
+		c.JSON(http.StatusInternalServerError, StandardResponse{
+			Success: false,
+			Error:   "База данных недоступна",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Data: gin.H{
+			"status":  "ok",
+			"time":    time.Now().Format(time.RFC3339),
+			"version": AppVersion,
+		},
+	})
+}
+
+// getClientInfoHandler обрабатывает GET /client-info для получения информации о клиенте
+func getClientInfoHandler(c *gin.Context) {
+	userAgent := c.Request.UserAgent()
+	ip := c.ClientIP()
+
+	// Определение типа устройства, браузера и ОС
+	deviceType := "desktop"
+	if strings.Contains(strings.ToLower(userAgent), "mobile") {
+		deviceType = "mobile"
+	} else if strings.Contains(strings.ToLower(userAgent), "tablet") {
+		deviceType = "tablet"
+	}
+
+	browser := parseBrowser(userAgent)
+	os := parseOS(userAgent)
+	
+	// Определение поддерживаемой локали
+	acceptLanguage := c.GetHeader("Accept-Language")
+	preferredLanguage := "en" // По умолчанию английский
+	
+	if strings.Contains(acceptLanguage, "ru") {
+		preferredLanguage = "ru"
+	} else if strings.Contains(acceptLanguage, "en") {
+		preferredLanguage = "en"
+	}
+
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Data: gin.H{
+			"ip":          ip,
+			"userAgent":   userAgent,
+			"deviceType":  deviceType,
+			"browser":     browser,
+			"os":          os,
+			"language":    preferredLanguage,
+			"timestamp":   time.Now().Format(time.RFC3339),
+			"apiVersion":  AppVersion,
+		},
+	})
+}
+
+// parseOS извлекает информацию об ОС из User-Agent
+func parseOS(userAgent string) string {
+	userAgent = strings.ToLower(userAgent)
+	
+	switch {
+	case strings.Contains(userAgent, "windows"):
+		return "Windows"
+	case strings.Contains(userAgent, "mac os"):
+		return "macOS"
+	case strings.Contains(userAgent, "ios"):
+		return "iOS"
+	case strings.Contains(userAgent, "android"):
+		return "Android"
+	case strings.Contains(userAgent, "linux"):
+		return "Linux"
+	default:
+		return "Unknown"
+	}
+}
+
+// rateLimiterMiddleware реализует ограничение частоты запросов для защиты от brute-force атак
+func rateLimiterMiddleware(c *gin.Context) {
+	ip := c.ClientIP()
+	endpoint := c.FullPath()
+	
+	// Лимиты для разных эндпоинтов
+	var limit int
+	var duration time.Duration
+	
+	switch {
+	case endpoint == "/login" || endpoint == "/register" || endpoint == "/forgot-password":
+		limit = 5      // 5 запросов
+		duration = time.Minute  // за 1 минуту
+	case strings.Contains(endpoint, "/2fa"):
+		limit = 3      // 3 запроса
+		duration = time.Minute  // за 1 минуту
+	default:
+		limit = 60     // 60 запросов
+		duration = time.Minute  // за 1 минуту
+	}
+	
+	// Ключ для кэша: IP + эндпоинт
+	key := fmt.Sprintf("%s:%s", ip, endpoint)
+	
+	// Проверяем количество запросов
+	requestCount, found := rateLimiterCache.Get(key)
+	if !found {
+		rateLimiterCache.Set(key, 1, duration)
+	} else {
+		count := requestCount.(int)
+		if count >= limit {
+			c.JSON(http.StatusTooManyRequests, StandardResponse{
+				Success: false,
+				Error:   "Слишком много запросов. Пожалуйста, попробуйте позже.",
+			})
+			c.Abort()
+			return
+		}
+		rateLimiterCache.Set(key, count+1, duration)
+	}
+	
+	c.Next()
+}
+
+// logMiddleware логирует все запросы
+func logMiddleware(c *gin.Context) {
+	// Время начала запроса
+	startTime := time.Now()
+	
+	// Обработка запроса
+	c.Next()
+	
+	// Время окончания запроса
+	endTime := time.Now()
+	
+	// Статус ответа
+	status := c.Writer.Status()
+	
+	// Запись в лог
+	log.Printf("[%s] %s %s %d %v",
+		c.ClientIP(),
+		c.Request.Method,
+		c.Request.URL.Path,
+		status,
+		endTime.Sub(startTime),
+	)
+}
+
+// metricsHandler обрабатывает GET /metrics для мониторинга
+func metricsHandler(c *gin.Context) {
+	sqlDB, err := db.DB()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, StandardResponse{
+			Success: false,
+			Error:   "Ошибка подключения к базе данных",
+		})
+		return
+	}
+	
+	// Статистика подключений к БД
+	stats := sqlDB.Stats()
+	
+	// Статистика использования системы
+	var userCount int64
+	var activeUsersLast24h int64
+	var twoFAEnabledCount int64
+	
+	db.Model(&User{}).Count(&userCount)
+	
+	yesterday := time.Now().Add(-24 * time.Hour)
+	db.Model(&LoginHistory{}).Where("created_at > ?", yesterday).
+		Distinct("user_id").Count(&activeUsersLast24h)
+		
+	db.Model(&User{}).Where("two_factor_enabled = ?", true).Count(&twoFAEnabledCount)
+	
+	// Статистика памяти
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Data: gin.H{
+			"system": gin.H{
+				"version":     AppVersion,
+				"uptime":      time.Since(startTime).String(),
+				"goroutines":  runtime.NumGoroutine(),
+				"memory": gin.H{
+					"allocatedMB": float64(memStats.Alloc) / 1024 / 1024,
+					"systemMB":    float64(memStats.Sys) / 1024 / 1024,
+				},
+			},
+			"database": gin.H{
+				"openConnections": stats.OpenConnections,
+				"inUse":           stats.InUse,
+				"idle":            stats.Idle,
+			},
+			"users": gin.H{
+				"total":           userCount,
+				"activeLast24h":   activeUsersLast24h,
+				"with2FAEnabled":  twoFAEnabledCount,
+				"percentWith2FA":  float64(twoFAEnabledCount) / float64(userCount) * 100,
+			},
+		},
+	})
+}
+
+// getPerformanceConfigHandler обрабатывает GET /user/performance-config
+func getPerformanceConfigHandler(c *gin.Context) {
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, StandardResponse{
+			Success: false,
+			Error:   "Пользователь не авторизован",
+		})
+		return
+	}
+
+	var config PerformanceConfig
+	result := db.Where("user_id = ?", userID).First(&config)
+	
+	// Если конфигурация не найдена, создаем настройки по умолчанию
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			config = PerformanceConfig{
+				ID:                 uuid.New(),
+				UserID:             userID.(uuid.UUID),
+				ReduceShadows:      false,
+				LightEffects:       false,
+				BlurIntensity:      5,
+				AnimationsEnabled:  true,
+				PreloadAssets:      true,
+				ImageQuality:       90,
+				EnableHardwareAcceleration: true,
+				CreatedAt:          time.Now(),
+				UpdatedAt:          time.Now(),
+			}
+			
+			if err := db.Create(&config).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, StandardResponse{
+					Success: false,
+					Error:   "Ошибка при создании конфигурации производительности",
+				})
+				return
+			}
+		} else {
+			c.JSON(http.StatusInternalServerError, StandardResponse{
+				Success: false,
+				Error:   "Ошибка при получении конфигурации производительности",
+			})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Data:    config,
+	})
+}
+
+// updatePerformanceConfigHandler обрабатывает PATCH /user/performance-config
+func updatePerformanceConfigHandler(c *gin.Context) {
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, StandardResponse{
+			Success: false,
+			Error:   "Пользователь не авторизован",
+		})
+		return
+	}
+
+	var request PerformanceConfig
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, StandardResponse{
+			Success: false,
+			Error:   "Некорректные данные запроса",
+		})
+		return
+	}
+
+	var config PerformanceConfig
+	result := db.Where("user_id = ?", userID).First(&config)
+	
+	// Если конфигурация не найдена, создаем новую
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			config = PerformanceConfig{
+				ID:     uuid.New(),
+				UserID: userID.(uuid.UUID),
+			}
+		} else {
+			c.JSON(http.StatusInternalServerError, StandardResponse{
+				Success: false,
+				Error:   "Ошибка при получении конфигурации производительности",
+			})
+			return
+		}
+	}
+
+	// Обновляем только переданные поля
+	if request.ReduceShadows != config.ReduceShadows {
+		config.ReduceShadows = request.ReduceShadows
+	}
+	if request.LightEffects != config.LightEffects {
+		config.LightEffects = request.LightEffects
+	}
+	if request.BlurIntensity >= 1 && request.BlurIntensity <= 10 {
+		config.BlurIntensity = request.BlurIntensity
+	}
+	if request.AnimationsEnabled != config.AnimationsEnabled {
+		config.AnimationsEnabled = request.AnimationsEnabled
+	}
+	if request.PreloadAssets != config.PreloadAssets {
+		config.PreloadAssets = request.PreloadAssets
+	}
+	if request.ImageQuality >= 1 && request.ImageQuality <= 100 {
+		config.ImageQuality = request.ImageQuality
+	}
+	if request.EnableHardwareAcceleration != config.EnableHardwareAcceleration {
+		config.EnableHardwareAcceleration = request.EnableHardwareAcceleration
+	}
+	
+	config.UpdatedAt = time.Now()
+
+	// Сохраняем конфигурацию
+	if result.Error != nil && errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		if err := db.Create(&config).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, StandardResponse{
+				Success: false,
+				Error:   "Ошибка при создании конфигурации производительности",
+			})
+			return
+		}
+	} else {
+		if err := db.Save(&config).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, StandardResponse{
+				Success: false,
+				Error:   "Ошибка при обновлении конфигурации производительности",
+			})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Message: "Настройки производительности успешно обновлены",
+		Data:    config,
+	})
+}
+
+// getOptimizedUiConfigHandler обрабатывает GET /ui/optimized-config
+func getOptimizedUiConfigHandler(c *gin.Context) {
+	// Определяем устройство и его возможности
+	userAgent := c.Request.UserAgent()
+	deviceType := "desktop"
+	if strings.Contains(strings.ToLower(userAgent), "mobile") {
+		deviceType = "mobile"
+	} else if strings.Contains(strings.ToLower(userAgent), "tablet") {
+		deviceType = "tablet"
+	}
+
+	// Определяем базовые настройки в зависимости от устройства
+	blurIntensity := 5
+	reduceShadows := false
+	lightEffects := false
+	
+	if deviceType == "mobile" {
+		blurIntensity = 3
+		reduceShadows = true
+		lightEffects = true
+	}
+
+	// Проверяем авторизацию пользователя
+	userID, exists := c.Get("userID")
+	if exists {
+		// Если пользователь авторизован, проверяем его настройки
+		var config PerformanceConfig
+		if err := db.Where("user_id = ?", userID).First(&config).Error; err == nil {
+			// Используем пользовательские настройки
+			blurIntensity = config.BlurIntensity
+			reduceShadows = config.ReduceShadows
+			lightEffects = config.LightEffects
+		}
+	}
+
+	c.JSON(http.StatusOK, StandardResponse{
+		Success: true,
+		Data: gin.H{
+			"deviceType":      deviceType,
+			"blurIntensity":   blurIntensity,
+			"reduceShadows":   reduceShadows,
+			"lightEffects":    lightEffects,
+			"glassOpacity":    func() float64 {
+				if deviceType == "mobile" {
+					return 0.2
+				}
+				return 0.15
+			}(),
+			"animationSpeed":  func() string {
+				if deviceType == "mobile" {
+					return "fast"
+				}
+				return "normal"
+			}(),
+			"optimizedTheme":  generateOptimizedTheme(deviceType, reduceShadows, lightEffects),
+		},
+	})
+}
+
+// generateOptimizedTheme генерирует оптимизированные настройки темы
+func generateOptimizedTheme(deviceType string, reduceShadows, lightEffects bool) gin.H {
+	// Базовые настройки
+	shadow := gin.H{
+		"blur":     func() int {
+			if reduceShadows {
+				return 10
+			}
+			return 20
+		}(),
+		"spread":   func() int {
+			if reduceShadows {
+				return 0
+			}
+			return 5
+		}(),
+		"opacity":  func() float64 {
+			if reduceShadows {
+				return 0.2
+			}
+			return 0.3
+		}(),
+	}
+
+	glass := gin.H{
+		"opacity":        func() float64 {
+			if deviceType == "mobile" {
+				return 0.2
+			}
+			return 0.15
+		}(),
+		"blur":           func() int {
+			if deviceType == "mobile" {
+				return 3
+			}
+			return 5
+		}(),
+		"borderWidth":    func() float64 {
+			if deviceType == "mobile" {
+				return 0.5
+			}
+			return 1.0
+		}(),
+		"borderOpacity":  func() float64 {
+			if deviceType == "mobile" {
+				return 0.3
+			}
+			return 0.2
+		}(),
+	}
+
+	animation := gin.H{
+		"duration":   func() int {
+			if deviceType == "mobile" {
+				return 300
+			}
+			return 500
+		}(),
+		"enabled":    !lightEffects,
+		"staggered":  !lightEffects && deviceType != "mobile",
+	}
+
+	return gin.H{
+		"shadow":     shadow,
+		"glass":      glass,
+		"animation":  animation,
+	}
+}
+
 func main() {
 	migrateFlag := flag.Bool("migrate", false, "Выполнить миграции базы данных и выйти")
 	flag.Parse()
+
+	startTime = time.Now()
 
 	var err error
 	config, err = LoadConfig("config.yml")
@@ -1636,7 +2302,7 @@ func main() {
 	}
 
 	// Миграция моделей
-	if err := db.AutoMigrate(&User{}, &Cosmetic{}, &LoginHistory{}, &BackupCode{}, &Device{}, &SecurityPreference{}, &Notification{}, &ActivityLog{}); err != nil {
+	if err := db.AutoMigrate(&User{}, &Cosmetic{}, &LoginHistory{}, &BackupCode{}, &Device{}, &SecurityPreference{}, &Notification{}, &ActivityLog{}, &PerformanceConfig{}); err != nil {
 		log.Fatalf("Ошибка миграции: %v", err)
 	}
 
@@ -1648,6 +2314,7 @@ func main() {
 	// Инициализация in-memory кэшей
 	tokenBlacklistCache = cache.New(time.Duration(config.Auth.TokenExpirationMinutes)*time.Minute, 10*time.Minute)
 	resetTokenCache = cache.New(time.Duration(config.Auth.ResetTokenExpiration)*time.Minute, 10*time.Minute)
+	rateLimiterCache = cache.New(1*time.Hour, 10*time.Minute)
 
 	// Инициализация генератора случайных чисел для создания резервных кодов
 	// В новых версиях Go используется rand.NewSource и rand.New вместо устаревшего rand.Seed
@@ -1662,6 +2329,11 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}
 	router.Use(cors.New(publicCors))
+
+	// Публичные эндпоинты, не требующие авторизации
+	router.GET("/version", getVersionHandler)
+	router.GET("/health", healthCheckHandler)
+	router.GET("/client-info", getClientInfoHandler)
 
 	// Эндпоинты аутентификации
 	router.POST("/login", loginHandler)
@@ -1723,7 +2395,22 @@ func main() {
 		authRoutes.PATCH("/user/notifications/:id/read", markNotificationReadHandler)
 		authRoutes.GET("/user/notifications/settings", getNotificationSettingsHandler)
 		authRoutes.PATCH("/user/notifications/settings", updateNotificationSettingsHandler)
+
+		// Настройки пользователя
+		authRoutes.GET("/user/preferences", getUserPreferencesHandler)
+		authRoutes.PATCH("/user/preferences", updateUserPreferencesHandler)
+
+		// Настройки производительности
+		authRoutes.GET("/user/performance-config", getPerformanceConfigHandler)
+		authRoutes.PATCH("/user/performance-config", updatePerformanceConfigHandler)
 	}
+
+	// Дополнительные эндпоинты
+	router.GET("/metrics", metricsHandler)
+
+	// Middleware для защиты от brute-force атак
+	router.Use(rateLimiterMiddleware)
+	router.Use(logMiddleware)
 
 	// Запуск сервера с graceful shutdown
 	port := config.Server.Port
